@@ -7,19 +7,18 @@ import time
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Callable, Set, Tuple, Dict
+from typing import List, Optional, Callable, Set, Tuple
 
 from openpyxl import load_workbook
 
 
-# =========================
+# =========================================================
 # Utils
-# =========================
+# =========================================================
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
-    s = s.replace("&", " ").replace("-", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 def _cap(s: str) -> str:
@@ -27,20 +26,27 @@ def _cap(s: str) -> str:
     return s[:1].upper() + s[1:] if s else s
 
 
-def _jaccard(a: str, b: str) -> float:
-    wa = set(re.findall(r"[a-zа-я0-9]+", (a or "").lower()))
-    wb = set(re.findall(r"[a-zа-я0-9]+", (b or "").lower()))
-    return len(wa & wb) / max(len(wa | wb), 1)
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name or "")
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:120] if name else "output"
 
 
 def _first_sentences(text: str, n: int) -> str:
-    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    parts = [p.strip() for p in parts if p.strip()]
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
     return " ".join(parts[:n]).strip()
 
 
+def _jaccard(a: str, b: str) -> float:
+    wa = set(re.findall(r"[a-zа-я0-9]+", a.lower()))
+    wb = set(re.findall(r"[a-zа-я0-9]+", b.lower()))
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
 def _join_ru(items: List[str]) -> str:
-    items = [x.strip() for x in items if x and x.strip()]
+    items = [x.strip() for x in items if x.strip()]
     if not items:
         return ""
     if len(items) == 1:
@@ -50,20 +56,16 @@ def _join_ru(items: List[str]) -> str:
     return ", ".join(items[:-1]) + " и " + items[-1]
 
 
-def _safe_filename(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:120] if name else "output"
-
-
-# =========================
+# =========================================================
 # Params
-# =========================
+# =========================================================
 @dataclass
 class FillParams:
     xlsx_path: str
     output_dir: str
+
+    file_prefix: str
+    start_index: int
 
     brand_lat: str
     brand_ru: str
@@ -76,383 +78,584 @@ class FillParams:
 
     seo_level: str
     style: str
+
     wb_safe: bool
     wb_strict: bool
 
     brand_title_ratio: str
+
     rows_to_fill: int
     skip_first_rows: int
     batch_count: int
 
-    # WB extra fields (from Tom.xlsx)
     fill_wb_fields: bool
-    overwrite_wb_fields_if_not_empty: bool  # False = fill only if empty
+    overwrite_wb_fields_if_not_empty: bool
+
     kiz: bool
     adult18: bool
+
     gender: str
     color: str
     composition: str
 
     progress_callback: Optional[Callable[[int], None]] = None
-    uniqueness: int = 92
 
 
-# =========================
-# Pools
-# =========================
-SLOGANS = [
-    "Красивые", "Крутые", "Стильные", "Модные", "Молодёжные", "Трендовые",
-    "Эффектные", "Лёгкие", "Актуальные", "Дизайнерские", "Удобные",
-    "Свежие", "Яркие", "Универсальные", "Аккуратные", "Летние",
-    "Выразительные", "Солидные", "Новые", "Топовые",
+# =========================================================
+# HUMAN SELLER ENGINE
+# =========================================================
+
+PERSONAS = {
+    "casual": {
+        "starters": [
+            "Очки хорошо смотрятся на каждый день.",
+            "Модель смотрится аккуратно и без лишнего перегруза.",
+            "На лице очки выглядят легко и современно.",
+            "Хороший вариант на повседневку и поездки.",
+            "Очки смотрятся спокойно, но образ сразу становится интереснее.",
+        ],
+        "tone": "simple",
+    },
+
+    "fashion": {
+        "starters": [
+            "Очки сразу делают образ более стильным и заметным.",
+            "Модель выглядит модно и хорошо вписывается в современные образы.",
+            "Такие очки легко становятся акцентом в образе.",
+            "Оправа смотрится эффектно и сразу притягивает внимание.",
+        ],
+        "tone": "fashion",
+    },
+
+    "mass": {
+        "starters": [
+            "Удобные очки на каждый день.",
+            "Хороший вариант для города, прогулок и отдыха.",
+            "Практичная модель, которую легко сочетать с одеждой.",
+            "Очки подойдут и под обычный стиль, и под отпуск.",
+        ],
+        "tone": "mass",
+    },
+
+    "luxury": {
+        "starters": [
+            "Очки выглядят аккуратно и дорого.",
+            "Модель смотрится сдержанно и стильно.",
+            "Оправа выглядит выразительно, но без лишней яркости.",
+            "Очки легко дополняют более собранные и дорогие образы.",
+        ],
+        "tone": "luxury",
+    },
+}
+
+
+CHAOS_LINKS = [
+    "Вообще",
+    "Кстати",
+    "При этом",
+    "По ощущениям",
+    "На деле",
+    "Если носить каждый день",
+    "В целом",
 ]
-PRODUCTS = ["солнцезащитные очки", "солнечные очки"]
 
-SCENES = [
-    "город", "прогулки", "отпуск", "пляж", "поездки",
-    "путешествия", "дорога", "выходные", "летние дни", "вождение",
-]
 
-SEO_BASE = [
+SEO_KEYS = [
     "очки солнцезащитные",
     "солнечные очки",
-    "модные очки",
-    "очки для отпуска",
-    "очки для города",
     "очки женские",
     "очки мужские",
     "очки унисекс",
-    "брендовые очки",
+    "очки для отпуска",
+    "модные очки",
     "очки uv400",
-    "инста очки",
-    "очки из tiktok",
-]
-
-RISK_WORDS = [
-    r"\b100%\b", r"\bлучшие\b", r"\bсамые лучшие\b",
-    r"\bгарантированно\b", r"\bидеальные\b", r"\bабсолютно\b",
-]
-
-STOP_PHRASES_STRICT = [
-    r"\bпо факту\b", r"\bпрям\b", r"\bреально\b", r"\bтоп\b",
+    "брендовые очки",
 ]
 
 
-# =========================
-# SEO pack
-# =========================
-def _seo_pack(rnd: random.Random, level: str, strict: bool) -> List[str]:
-    keys = SEO_BASE[:]
-    if strict:
-        keys = [k for k in keys if "инста" not in k and "tiktok" not in k]
-    rnd.shuffle(keys)
-    level = (level or "normal").strip().lower()
-    if level == "low":
-        return keys[:3]
-    if level == "high":
-        return keys[:6]
-    return keys[:4]
+# =========================================================
+# TITLE ENGINE
+# =========================================================
+TITLE_STARTS = [
+    "Стильные",
+    "Модные",
+    "Красивые",
+    "Трендовые",
+    "Удобные",
+    "Летние",
+    "Актуальные",
+    "Эффектные",
+    "Молодёжные",
+]
+
+TITLE_PRODUCTS = [
+    "солнцезащитные очки",
+    "солнечные очки",
+]
 
 
-# =========================
-# Title
-# =========================
-def make_title(rnd: random.Random, brand_ru: str, shape: str, lenses: str, ratio: str, used: Set[str]) -> str:
-    for _ in range(25):
-        slogan = rnd.choice(SLOGANS)
-        prod = rnd.choice(PRODUCTS)
+def make_title(
+    rnd: random.Random,
+    p: FillParams,
+    used_titles: Set[str],
+) -> str:
 
-        ratio = (ratio or "50/50").strip()
+    for _ in range(30):
+        parts = []
+
+        parts.append(rnd.choice(TITLE_STARTS))
+        parts.append(rnd.choice(TITLE_PRODUCTS))
+
+        include_brand = False
+
+        ratio = (p.brand_title_ratio or "50/50").strip()
+
         if ratio == "100/0":
             include_brand = True
-        elif ratio == "0/100":
-            include_brand = False
-        else:
+        elif ratio == "50/50":
             include_brand = rnd.random() < 0.5
 
-        parts = [slogan, prod]
-        if include_brand and brand_ru:
-            parts.append(brand_ru)
+        if include_brand and p.brand_ru:
+            parts.append(p.brand_ru)
 
-        # иногда добавим линзы/форму без капса
-        if lenses and rnd.random() < 0.60:
-            parts.append(lenses.strip())
-        if shape and rnd.random() < 0.45:
-            parts.append(shape.strip().lower())
+        if p.shape and rnd.random() < 0.45:
+            parts.append(p.shape.lower())
 
-        title = " ".join([p for p in parts if p]).strip()
+        if p.lenses and rnd.random() < 0.45:
+            parts.append(p.lenses)
 
-        # <= 60 без обрезки слов: если длинно — выкидываем хвост
+        title = " ".join([x for x in parts if x]).strip()
+
         while len(title) > 60 and len(parts) > 2:
             parts.pop()
-            title = " ".join([p for p in parts if p]).strip()
-        if len(title) > 60:
-            title = title[:60].rstrip()
+            title = " ".join(parts)
 
         sig = _norm(title)
-        if sig not in used:
-            used.add(sig)
+
+        if sig not in used_titles:
+            used_titles.add(sig)
             return title
 
     return title
 
 
-# =========================
-# Description (народно + анти-монотонность)
-# =========================
-def _apply_safe(text: str) -> str:
-    t = text
-    for r in RISK_WORDS:
-        t = re.sub(r, "", t, flags=re.I)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
+# =========================================================
+# HUMAN DESCRIPTION ENGINE
+# =========================================================
+def _pick_persona(style: str) -> str:
+    style = (style or "").strip().lower()
+
+    if style == "premium":
+        return "luxury"
+
+    if style == "mass":
+        return "mass"
+
+    if style == "social":
+        return "fashion"
+
+    return "casual"
 
 
-def _apply_strict(text: str) -> str:
-    t = text
-    for r in STOP_PHRASES_STRICT:
-        t = re.sub(r, "", t, flags=re.I)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
+def _seo_mix(rnd: random.Random, strict: bool) -> List[str]:
+    keys = SEO_KEYS[:]
+
+    if strict:
+        keys = [k for k in keys if "инста" not in k and "tiktok" not in k]
+
+    rnd.shuffle(keys)
+    return keys[:3]
 
 
-def make_description(rnd: random.Random, p: FillParams, used_descs: List[str], used_open2: Set[str], used_open3: Set[str]) -> str:
-    # thresholds from uniqueness
-    uni = max(0, min(100, int(p.uniqueness)))
-    max_sim = 0.55 - (uni / 400.0)     # 92 => ~0.32
-    max_sim = max(0.18, min(0.55, max_sim))
+def _human_noise(rnd: random.Random) -> str:
+    if rnd.random() < 0.45:
+        return rnd.choice(CHAOS_LINKS) + ", "
+    return ""
 
-    first_pool = [
-        "Очки отлично дополняют образ и подходят на каждый день.",
-        "Эти очки легко вписываются в повседневный стиль и не перегружают лицо.",
-        "Аксессуар, который делает образ собранным и аккуратным — без лишнего шума.",
-        "Очки смотрятся современно и подходят под разные образы — и повседневные, и более нарядные.",
-        "Лёгкая деталь, которая меняет образ: становится заметнее и аккуратнее.",
-        "Очки выглядят аккуратно и “дорого”, при этом носить удобно каждый день.",
-        "Хороший вариант на сезон: и стиль добавляет, и от солнца помогает.",
-    ]
 
-    for _ in range(30):
-        rnd.shuffle(first_pool)
-        first = first_pool[0]
+def make_description(
+    rnd: random.Random,
+    p: FillParams,
+    used_descs: List[str],
+    used_open2: Set[str],
+    used_open3: Set[str],
+) -> str:
 
-        blocks: List[str] = [first]
+    persona_name = _pick_persona(p.style)
+    persona = PERSONAS[persona_name]
 
-        # бренд латиницей — естественно
-        if p.brand_lat:
-            blocks.append(f"Модель {p.brand_lat} смотрится уверенно и легко сочетается с одеждой на каждый день.")
+    for _ in range(40):
 
-        # форма — без ярлыков
-        if p.shape:
-            blocks.append("Оправа подчёркивает черты лица и добавляет образу выразительности — выглядит гармонично.")
+        blocks = []
 
-        # линзы — по делу
-        if p.lenses:
+        # =================================================
+        # START
+        # =================================================
+        start = rnd.choice(persona["starters"])
+        blocks.append(start)
+
+        # =================================================
+        # BRAND
+        # =================================================
+        if p.brand_lat and rnd.random() < 0.7:
+            blocks.append(
+                f"{_human_noise(rnd)}модель {p.brand_lat} легко сочетается с повседневной одеждой и не выглядит слишком тяжёлой."
+            )
+
+        # =================================================
+        # SHAPE
+        # =================================================
+        if p.shape and rnd.random() < 0.8:
+            shape_lines = [
+                "Оправа подчёркивает лицо и выглядит аккуратно.",
+                "Форма оправы смотрится современно и хорошо вписывается в разные стили.",
+                "Оправа выглядит выразительно, но не перегружает образ.",
+                "Такая форма оправы подходит под повседневный стиль и поездки.",
+            ]
+            blocks.append(_human_noise(rnd) + rnd.choice(shape_lines))
+
+        # =================================================
+        # LENSES
+        # =================================================
+        if p.lenses and rnd.random() < 0.8:
+
             lk = _norm(p.lenses)
+
             if "uv400" in lk:
-                blocks.append("Линзы UV400 дают комфорт при ярком солнце — удобно в городе, в дороге и на отдыхе.")
+                lens_line = "Линзы UV400 помогают чувствовать себя комфортно в солнечную погоду."
+
             elif "поляр" in lk:
-                blocks.append("Поляризационные линзы уменьшают блики — удобно за рулём и у воды.")
-            elif "фотох" in lk or "хамелеон" in lk:
-                blocks.append("Фотохромные линзы (хамелеон) подстраиваются под свет — комфортно, когда освещение меняется.")
+                lens_line = "Поляризационные линзы уменьшают блики — особенно удобно за рулём и на улице."
+
+            elif "хамелеон" in lk or "фотох" in lk:
+                lens_line = "Фотохромные линзы подстраиваются под освещение, поэтому носить очки удобно в течение дня."
+
             else:
-                blocks.append("Линзы помогают чувствовать себя комфортно при ярком солнце.")
+                lens_line = "Линзы делают использование очков более комфортным при ярком солнце."
 
-        # сценарии
-        blocks.append(f"Подойдут для таких ситуаций: {', '.join(rnd.sample(SCENES, 4))}. Можно брать себе или на подарок.")
+            blocks.append(_human_noise(rnd) + lens_line)
 
-        # коллекция — без метки
-        if p.collection and rnd.random() < 0.85:
-            blocks.append(f"Сезон {p.collection}: хороший вариант, чтобы обновить аксессуары к тёплому времени года.")
+        # =================================================
+        # DAILY LIFE
+        # =================================================
+        if rnd.random() < 0.9:
+            life_lines = [
+                "Подойдут для прогулок, поездок, отдыха и обычного городского ритма.",
+                "Очки удобно носить каждый день — и в городе, и на отдыхе.",
+                "Модель подойдёт под повседневный стиль, отпуск и поездки.",
+                "Очки хорошо смотрятся и с более спокойной одеждой, и с летними образами.",
+            ]
+            blocks.append(_human_noise(rnd) + rnd.choice(life_lines))
 
-        # праздники (мульти)
+        # =================================================
+        # GENDER
+        # =================================================
+        if p.gender:
+            g = _norm(p.gender)
+
+            if "уни" in g:
+                blocks.append(
+                    "Модель унисекс — хорошо подойдёт как девушкам, так и мужчинам."
+                )
+
+            elif "жен" in g:
+                blocks.append(
+                    "Очки хорошо дополняют женские образы и выглядят современно."
+                )
+
+            elif "муж" in g:
+                blocks.append(
+                    "Модель смотрится сдержанно и хорошо подходит под мужской стиль."
+                )
+
+        # =================================================
+        # HOLIDAYS
+        # =================================================
         if p.holidays:
-            hs = [h.strip() for h in p.holidays.split("||") if h.strip()]
+
+            hs = [x.strip() for x in p.holidays.split("||") if x.strip()]
+
             if hs:
-                holiday_line = f"Часто выбирают в подарок к {_join_ru(hs)} — практично и выглядит красиво."
+                holiday_line = (
+                    f"Часто выбирают в подарок к {_join_ru(hs)}."
+                )
+
                 pos = (p.holiday_pos or "middle").lower()
+
                 if pos == "start":
                     blocks.insert(1, holiday_line)
+
                 elif pos == "end":
                     blocks.append(holiday_line)
+
                 else:
                     blocks.insert(min(3, len(blocks)), holiday_line)
 
-        # SEO — вплетаем, НЕ отдельной SEO-фразой
-        keys = _seo_pack(rnd, p.seo_level, p.wb_strict)
-        if keys:
-            mid_templates = [
-                f"По сути это {keys[0]} — удобный вариант на каждый день.",
-                f"Если коротко: это {keys[0]}, который хорошо смотрится и в городе, и в поездках.",
-                f"Можно сказать так: {keys[0]} для тех, кто любит аккуратный стиль.",
-            ]
-            blocks.insert(min(2, len(blocks)), rnd.choice(mid_templates))
+        # =================================================
+        # SEO
+        # =================================================
+        keys = _seo_mix(rnd, p.wb_strict)
 
-        tail_keys = [k for k in keys[1:3] if k] if len(keys) > 1 else []
-        if tail_keys:
-            tail_templates = [
-                f"Подойдёт тем, кто выбирает {', '.join(tail_keys)}.",
-                f"Хороший выбор, если нужны {', '.join(tail_keys)} без лишнего пафоса.",
-                f"Если ищешь {', '.join(tail_keys)}, этот вариант будет уместным.",
+        if keys and rnd.random() < 0.9:
+            seo_lines = [
+                f"Подойдут тем, кто любит {keys[0]} без тяжёлой оправы.",
+                f"Если нравятся {keys[0]}, эта модель хорошо впишется в гардероб.",
+                f"Хороший вариант для тех, кто выбирает {keys[0]} на каждый день.",
             ]
-            blocks.append(rnd.choice(tail_templates))
+            blocks.append(rnd.choice(seo_lines))
 
-        text = " ".join(_cap(b).rstrip(".") + "." for b in blocks)
+        # =================================================
+        # RANDOM HUMAN CHAOS
+        # =================================================
+        rnd.shuffle(blocks[1:])
+
+        # =================================================
+        # DYNAMIC LENGTH
+        # =================================================
+        mode = rnd.choice(["short", "medium", "long"])
+
+        if mode == "short":
+            blocks = blocks[:4]
+
+        elif mode == "medium":
+            blocks = blocks[:6]
+
+        # long = all
+
+        # =================================================
+        # BUILD
+        # =================================================
+        text = " ".join(
+            _cap(x).rstrip(".") + "."
+            for x in blocks if x.strip()
+        )
+
+        # =================================================
+        # STRICT CLEAN
+        # =================================================
+        if p.wb_strict:
+
+            text = re.sub(r"\bинста\b", "", text, flags=re.I)
+            text = re.sub(r"\btiktok\b", "", text, flags=re.I)
+
+            banned = [
+                "идеально",
+                "лучший",
+                "самый лучший",
+                "гарантия",
+                "топ",
+            ]
+
+            for b in banned:
+                text = re.sub(rf"\b{re.escape(b)}\b", "", text, flags=re.I)
+
+        # =================================================
+        # CLEAN
+        # =================================================
         text = re.sub(r"\s{2,}", " ", text).strip()
 
-        if p.wb_safe:
-            text = _apply_safe(text)
-        if p.wb_strict:
-            text = _apply_strict(text)
-
-        # анти одинаковых начал
+        # =================================================
+        # ANTI REPEATS
+        # =================================================
         sig2 = _norm(_first_sentences(text, 2))
         sig3 = _norm(_first_sentences(text, 3))
-        if sig2 in used_open2 or sig3 in used_open3:
+
+        if sig2 in used_open2:
             continue
 
-        # анти похожести
-        if any(_jaccard(text, prev) > max_sim for prev in used_descs[-25:]):
+        if sig3 in used_open3:
+            continue
+
+        # similarity
+        bad = False
+
+        for old in used_descs[-30:]:
+
+            if _jaccard(text, old) > 0.42:
+                bad = True
+                break
+
+        if bad:
             continue
 
         used_open2.add(sig2)
         used_open3.add(sig3)
         used_descs.append(text)
+
         return text
 
     return text
 
 
-# =========================
-# Excel helpers
-# =========================
+# =========================================================
+# EXCEL HELPERS
+# =========================================================
 def _detect_header_row(ws, scan: int = 30) -> int:
+
     for r in range(1, min(scan, ws.max_row) + 1):
-        row = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 80) + 1)]
-        joined = " | ".join([str(x) for x in row if x is not None])
-        j = _norm(joined)
-        if "наимен" in j and "описан" in j:
+
+        vals = []
+
+        for c in range(1, min(80, ws.max_column) + 1):
+            v = ws.cell(r, c).value
+            if v is not None:
+                vals.append(str(v))
+
+        joined = _norm(" | ".join(vals))
+
+        if "наимен" in joined and "описан" in joined:
             return r
+
     return 1
 
 
-def _find_col(ws, header_row: int, name_substr: str) -> Optional[int]:
-    target = _norm(name_substr)
+def _find_col(ws, header_row: int, needle: str):
+
+    needle = _norm(needle)
+
     for c in range(1, ws.max_column + 1):
+
         v = ws.cell(header_row, c).value
+
         if v is None:
             continue
-        if target in _norm(str(v)):
+
+        if needle in _norm(str(v)):
             return c
+
     return None
 
 
-def _set_cell(ws, r: int, c: int, value, overwrite: bool):
+def _set_cell(ws, r, c, value, overwrite: bool):
+
     cur = ws.cell(r, c).value
-    if (cur is None or str(cur).strip() == ""):
+
+    if cur is None or str(cur).strip() == "":
         ws.cell(r, c).value = value
         return
+
     if overwrite:
         ws.cell(r, c).value = value
 
 
-# =========================
-# Main fill
-# =========================
-def fill_wb_template(params: FillParams) -> Tuple[List[str], int, str]:
+# =========================================================
+# MAIN
+# =========================================================
+def fill_wb_template(params: FillParams):
+
     in_path = Path(params.xlsx_path)
     out_dir = Path(params.output_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    used_titles: Set[str] = set()
-    used_descs: List[str] = []
-    used_open2: Set[str] = set()
-    used_open3: Set[str] = set()
+    outputs = []
 
-    outputs: List[str] = []
+    used_titles = set()
+    used_descs = []
+
+    used_open2 = set()
+    used_open3 = set()
+
     total_filled = 0
 
-    total_steps = max(1, int(params.batch_count))
+    for i in range(int(params.batch_count)):
 
-    for file_idx in range(1, int(params.batch_count) + 1):
+        file_index = int(params.start_index) + i
+
         rnd = random.Random()
-        rnd.seed((time.time_ns() & 0xFFFFFFFFFFFF) ^ (file_idx * 99991) ^ (hash(params.brand_lat) & 0xFFFFFFFF))
+
+        rnd.seed(
+            time.time_ns()
+            ^ (file_index * 99991)
+            ^ hash(params.brand_lat)
+        )
 
         wb = load_workbook(in_path)
         ws = wb.active
 
         header_row = _detect_header_row(ws)
-        col_name = _find_col(ws, header_row, "Наименование")
-        col_desc = _find_col(ws, header_row, "Описание")
+
+        col_name = _find_col(ws, header_row, "наименование")
+        col_desc = _find_col(ws, header_row, "описание")
+
         if not col_name or not col_desc:
-            raise ValueError("Не найдены колонки Наименование и/или Описание (проверь заголовки)")
+            raise ValueError("Не найдены колонки Наименование/Описание")
 
-        # WB extra columns (Tom.xlsx)
-        col_kiz = _find_col(ws, header_row, "КИЗ")
+        # WB fields
+        col_kiz = _find_col(ws, header_row, "киз")
         col_18 = _find_col(ws, header_row, "18+")
-        col_gender = _find_col(ws, header_row, "Пол")
-        col_color = _find_col(ws, header_row, "Цвет")
-        col_comp = _find_col(ws, header_row, "Состав")
+        col_gender = _find_col(ws, header_row, "пол")
+        col_color = _find_col(ws, header_row, "цвет")
+        col_comp = _find_col(ws, header_row, "состав")
 
-        # rows area
         start_row = header_row + 1
-        skip_until = max(0, int(params.skip_first_rows))
-        eligible = [r for r in range(start_row, ws.max_row + 1) if r > skip_until]
-        eligible = eligible[: max(0, int(params.rows_to_fill))]
 
-        for r in eligible:
+        rows = [
+            r for r in range(start_row, ws.max_row + 1)
+            if r > int(params.skip_first_rows)
+        ]
+
+        rows = rows[:int(params.rows_to_fill)]
+
+        for r in rows:
+
             title = make_title(
-                rnd=rnd,
-                brand_ru=params.brand_ru,
-                shape=params.shape,
-                lenses=params.lenses,
-                ratio=params.brand_title_ratio,
-                used=used_titles,
+                rnd,
+                params,
+                used_titles,
             )
+
             desc = make_description(
-                rnd=rnd,
-                p=params,
-                used_descs=used_descs,
-                used_open2=used_open2,
-                used_open3=used_open3,
+                rnd,
+                params,
+                used_descs,
+                used_open2,
+                used_open3,
             )
 
             ws.cell(r, col_name).value = title
             ws.cell(r, col_desc).value = desc
 
-            # WB fields fill (optional)
+            # WB fields
             if params.fill_wb_fields:
+
                 ow = bool(params.overwrite_wb_fields_if_not_empty)
 
                 if col_kiz:
                     _set_cell(ws, r, col_kiz, "да" if params.kiz else "нет", ow)
+
                 if col_18:
                     _set_cell(ws, r, col_18, "да" if params.adult18 else "нет", ow)
-                if col_gender and params.gender.strip():
-                    _set_cell(ws, r, col_gender, params.gender.strip(), ow)
-                if col_color and params.color.strip():
-                    _set_cell(ws, r, col_color, params.color.strip(), ow)
-                if col_comp and params.composition.strip():
-                    _set_cell(ws, r, col_comp, params.composition.strip(), ow)
 
-        total_filled += len(eligible)
+                if col_gender and params.gender:
+                    _set_cell(ws, r, col_gender, params.gender, ow)
 
-        base = _safe_filename(in_path.stem)
-        out_name = f"{base}_{file_idx:02d}.xlsx" if int(params.batch_count) > 1 else f"{base}_out.xlsx"
+                if col_color and params.color:
+                    _set_cell(ws, r, col_color, params.color, ow)
+
+                if col_comp and params.composition:
+                    _set_cell(ws, r, col_comp, params.composition, ow)
+
+        total_filled += len(rows)
+
+        prefix = _safe_filename(params.file_prefix or in_path.stem)
+
+        out_name = f"{prefix}_{file_index:04d}.xlsx"
+
         out_path = out_dir / out_name
+
         wb.save(out_path)
+
         outputs.append(str(out_path))
 
         if params.progress_callback:
-            params.progress_callback(int(file_idx * 100 / total_steps))
+            params.progress_callback(
+                int((i + 1) * 100 / int(params.batch_count))
+            )
 
     report = {
-        "input": str(in_path),
         "outputs": outputs,
         "rows_total_filled": total_filled,
-        "rows_per_file": int(params.rows_to_fill),
-        "batch_count": int(params.batch_count),
-        "fill_wb_fields": bool(params.fill_wb_fields),
     }
 
     return outputs, total_filled, json.dumps(report, ensure_ascii=False, indent=2)
