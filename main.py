@@ -311,14 +311,27 @@ class App(QWidget):
         self._build_ui()
         self._restore_settings()
 
-        self.setMinimumSize(1050, 760)
+        self.resize(1280, 920)
+        self.setMinimumSize(1080, 720)
 
     def _build_ui(self):
         self.setWindowTitle(APP_NAME)
 
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        content = QWidget()
+
+        root = QVBoxLayout(content)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(12)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
         header = QGroupBox()
         hl = QVBoxLayout(header)
